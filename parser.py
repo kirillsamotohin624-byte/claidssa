@@ -1,10 +1,24 @@
+import asyncio
 import logging
+
 import httpx
+
 from config import CHAIN_BLACKLIST
 
 logger = logging.getLogger(__name__)
 
-OVERPASS_URL = "https://overpass-api.de/api/interpreter"
+OVERPASS_ENDPOINTS = [
+    "https://overpass-api.de/api/interpreter",
+    "https://overpass.kumi.systems/api/interpreter",
+    "https://overpass.private.coffee/api/interpreter",
+    "https://overpass.osm.jp/api/interpreter",
+]
+
+HTTP_HEADERS = {
+    "User-Agent": "TulaSmallBizBot/1.0 (Telegram bot for small business search; contact via Telegram)",
+    "Accept": "application/json",
+    "Accept-Language": "ru,en;q=0.8",
+}
 
 CATEGORY_QUERIES = {
     "салон красоты": '["shop"~"beauty|hairdresser"]',
@@ -12,12 +26,13 @@ CATEGORY_QUERIES = {
     "кафе": '["amenity"~"cafe|restaurant|bar"]',
     "фитнес клуб": '["leisure"~"fitness_centre|sports_centre"]',
     "автосервис": '["shop"~"car_repair|tyres"]',
-    "репетитор": '["amenity"="school"]["name"~"курс|репетит",i]',
+    "репетитор": '["amenity"~"language_school|training|college"]',
     "цветы магазин": '["shop"="florist"]',
     "магазин одежды": '["shop"="clothes"]',
 }
 
-TULA_BBOX = "(54.1,37.4,54.3,37.8)"
+TULA_BBOX = "(54.10,37.40,54.30,37.80)"
+
 
 def _is_chain(name: str) -> bool:
     lowered = name.lower()
@@ -26,15 +41,18 @@ def _is_chain(name: str) -> bool:
             return True
     return False
 
+
 def _build_query(tag_filter: str) -> str:
-    return f"""
-[out:json][timeout:25];
-(
-  node{tag_filter}{TULA_BBOX};
-  way{tag_filter}{TULA_BBOX};
-);
-out body;
-"""
+    return (
+        "[out:json][timeout:25];"
+        "("
+        f"node{tag_filter}{TULA_BBOX};"
+        f"way{tag_filter}{TULA_BBOX};"
+        f"relation{tag_filter}{TULA_BBOX};"
+        ");"
+        "out center tags;"
+    )
+
 
 def _extract_from_element(el: dict) -> dict | None:
     tags = el.get("tags") or {}
@@ -47,7 +65,7 @@ def _extract_from_element(el: dict) -> dict | None:
     phones = []
     phone = tags.get("phone") or tags.get("contact:phone")
     if phone:
-        phones = [p.strip() for p in phone.split(";")]
+        phones = [p.strip() for p in phone.split(";") if p.strip()]
 
     address_parts = []
     if tags.get("addr:street"):
@@ -61,6 +79,11 @@ def _extract_from_element(el: dict) -> dict | None:
     instagram = tags.get("contact:instagram")
     telegram = tags.get("contact:telegram")
 
+    if vk and not vk.startswith("http"):
+        vk = f"https://vk.com/{vk.lstrip('@/')}"
+    if telegram and not telegram.startswith("http"):
+        telegram = f"https://t.me/{telegram.lstrip('@/')}"
+
     return {
         "id": str(el.get("id", "")),
         "name": name,
@@ -73,21 +96,53 @@ def _extract_from_element(el: dict) -> dict | None:
         "rubrics": [],
     }
 
-async def search_businesses(query: str, page: int = 1, page_size: int = 20) -> list[dict]:
-    tag_filter = CATEGORY_QUERIES.get(query)
-    if not tag_filter:
-        tag_filter = f'["name"~"{query}",i]'
 
+async def _fetch_overpass(overpass_query: str) -> dict:
+    last_error: Exception | None = None
+    async with httpx.AsyncClient(timeout=30.0, headers=HTTP_HEADERS, follow_redirects=True) as client:
+        for endpoint in OVERPASS_ENDPOINTS:
+            try:
+                resp = await client.post(endpoint, data={"data": overpass_query})
+                if resp.status_code == 200:
+                    try:
+                        return resp.json()
+                    except Exception as e:
+                        last_error = RuntimeError(
+                            f"Не-JSON ответ от {endpoint}: {resp.text[:200]}"
+                        )
+                        logger.warning("Overpass %s вернул не JSON: %s", endpoint, e)
+                        continue
+                if resp.status_code in (429, 504):
+                    logger.warning("Overpass %s загружен (%s), пробую следующий", endpoint, resp.status_code)
+                    last_error = RuntimeError(f"{endpoint} вернул {resp.status_code}")
+                    await asyncio.sleep(0.5)
+                    continue
+                logger.warning(
+                    "Overpass %s вернул %s: %s",
+                    endpoint, resp.status_code, resp.text[:200],
+                )
+                last_error = RuntimeError(f"{endpoint} вернул {resp.status_code}")
+            except (httpx.HTTPError, httpx.TimeoutException) as e:
+                logger.warning("Overpass %s недоступен: %s", endpoint, e)
+                last_error = e
+    raise RuntimeError(f"Все Overpass-инстансы недоступны: {last_error}")
+
+
+def _resolve_filter(query: str) -> str:
+    tag_filter = CATEGORY_QUERIES.get(query)
+    if tag_filter:
+        return tag_filter
+    safe = query.replace('"', '\\"')
+    return f'["name"~"{safe}",i]'
+
+
+async def search_businesses(query: str, page: int = 1, page_size: int = 20) -> list[dict]:
+    tag_filter = _resolve_filter(query)
     overpass_query = _build_query(tag_filter)
 
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        resp = await client.post(OVERPASS_URL, data={"data": overpass_query})
-        if resp.status_code != 200:
-            logger.error("Overpass error %s: %s", resp.status_code, resp.text[:300])
-            raise RuntimeError(f"Overpass API вернул {resp.status_code}")
-        data = resp.json()
-
+    data = await _fetch_overpass(overpass_query)
     elements = data.get("elements") or []
+
     parsed = []
     for el in elements:
         item = _extract_from_element(el)
@@ -97,25 +152,16 @@ async def search_businesses(query: str, page: int = 1, page_size: int = 20) -> l
     start = (page - 1) * page_size
     return parsed[start:start + page_size]
 
-async def collect_small_business(query: str, limit: int = 30) -> list[dict]:
-    tag_filter = CATEGORY_QUERIES.get(query)
-    if not tag_filter:
-        tag_filter = f'["name"~"{query}",i]'
 
+async def collect_small_business(query: str, limit: int = 30) -> list[dict]:
+    tag_filter = _resolve_filter(query)
     overpass_query = _build_query(tag_filter)
 
-    try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            resp = await client.post(OVERPASS_URL, data={"data": overpass_query})
-            resp.raise_for_status()
-            data = resp.json()
-    except Exception as e:
-        logger.exception("Ошибка Overpass: %s", e)
-        raise
-
+    data = await _fetch_overpass(overpass_query)
     elements = data.get("elements") or []
+
     seen = set()
-    unique = []
+    unique: list[dict] = []
     for el in elements:
         item = _extract_from_element(el)
         if not item:
