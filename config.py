@@ -4,11 +4,8 @@ from dotenv import load_dotenv
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-TWOGIS_API_KEY = os.getenv("TWOGIS_API_KEY", "")
+YANDEX_API_KEY = os.getenv("YANDEX_API_KEY", "")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
-
-TULA_REGION_ID = 49
-TULA_COORDS = {"lon": 37.6173, "lat": 54.1961}
 
 PAGE_SIZE = 5
 
