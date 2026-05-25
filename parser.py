@@ -1,10 +1,23 @@
 import logging
 import httpx
-from config import CHAIN_BLACKLIST, YANDEX_API_KEY
+from config import CHAIN_BLACKLIST
 
 logger = logging.getLogger(__name__)
 
-YANDEX_URL = "https://search-maps.yandex.ru/v1/"
+OVERPASS_URL = "https://overpass-api.de/api/interpreter"
+
+CATEGORY_QUERIES = {
+    "салон красоты": '["shop"~"beauty|hairdresser"]',
+    "стоматология": '["amenity"="dentist"]',
+    "кафе": '["amenity"~"cafe|restaurant|bar"]',
+    "фитнес клуб": '["leisure"~"fitness_centre|sports_centre"]',
+    "автосервис": '["shop"~"car_repair|tyres"]',
+    "репетитор": '["amenity"="school"]["name"~"курс|репетит",i]',
+    "цветы магазин": '["shop"="florist"]',
+    "магазин одежды": '["shop"="clothes"]',
+}
+
+TULA_BBOX = "(54.1,37.4,54.3,37.8)"
 
 def _is_chain(name: str) -> bool:
     lowered = name.lower()
@@ -13,103 +26,106 @@ def _is_chain(name: str) -> bool:
             return True
     return False
 
-def _extract_contacts(feature: dict) -> dict:
-    props = feature.get("properties", {})
+def _build_query(tag_filter: str) -> str:
+    return f"""
+[out:json][timeout:25];
+(
+  node{tag_filter}{TULA_BBOX};
+  way{tag_filter}{TULA_BBOX};
+);
+out body;
+"""
+
+def _extract_from_element(el: dict) -> dict | None:
+    tags = el.get("tags") or {}
+    name = tags.get("name") or tags.get("name:ru") or ""
+    if not name:
+        return None
+    if _is_chain(name):
+        return None
+
     phones = []
-    website = None
-    
-    company_meta = props.get("CompanyMetaData", {})
-    
-    for phone in company_meta.get("Phones", []):
-        number = phone.get("formatted") or phone.get("number")
-        if number:
-            phones.append(number)
-    
-    website = company_meta.get("url")
-    
+    phone = tags.get("phone") or tags.get("contact:phone")
+    if phone:
+        phones = [p.strip() for p in phone.split(";")]
+
+    address_parts = []
+    if tags.get("addr:street"):
+        address_parts.append(tags["addr:street"])
+    if tags.get("addr:housenumber"):
+        address_parts.append(tags["addr:housenumber"])
+    address = ", ".join(address_parts) if address_parts else "Тула"
+
+    website = tags.get("website") or tags.get("contact:website")
+    vk = tags.get("contact:vk")
+    instagram = tags.get("contact:instagram")
+    telegram = tags.get("contact:telegram")
+
     return {
+        "id": str(el.get("id", "")),
+        "name": name,
+        "address": address,
         "phones": phones,
         "website": website,
-        "vk": None,
-        "instagram": None,
-        "telegram": None,
+        "vk": vk,
+        "instagram": instagram,
+        "telegram": telegram,
+        "rubrics": [],
     }
 
 async def search_businesses(query: str, page: int = 1, page_size: int = 20) -> list[dict]:
-    if not YANDEX_API_KEY:
-        raise RuntimeError("YANDEX_API_KEY не задан")
+    tag_filter = CATEGORY_QUERIES.get(query)
+    if not tag_filter:
+        tag_filter = f'["name"~"{query}",i]'
 
-    params = {
-        "apikey": YANDEX_API_KEY,
-        "text": f"{query} Тула",
-        "lang": "ru_RU",
-        "type": "biz",
-        "results": min(page_size, 50),
-        "skip": (page - 1) * page_size,
-        "ll": "37.6173,54.1961",
-        "spn": "0.5,0.5",
-        "rspn": 1,
-    }
+    overpass_query = _build_query(tag_filter)
 
-    async with httpx.AsyncClient(timeout=20.0) as client:
-        resp = await client.get(YANDEX_URL, params=params)
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.post(OVERPASS_URL, data={"data": overpass_query})
         if resp.status_code != 200:
-            logger.error("Yandex error %s: %s", resp.status_code, resp.text[:300])
-            raise RuntimeError(f"Yandex API вернул {resp.status_code}")
+            logger.error("Overpass error %s: %s", resp.status_code, resp.text[:300])
+            raise RuntimeError(f"Overpass API вернул {resp.status_code}")
         data = resp.json()
 
-    features = data.get("features") or []
-    
+    elements = data.get("elements") or []
     parsed = []
-    for feature in features:
-        props = feature.get("properties", {})
-        company = props.get("CompanyMetaData", {})
-        
-        name = company.get("name") or props.get("name") or ""
-        if not name:
-            continue
-        if _is_chain(name):
-            continue
-            
-        address = company.get("address") or props.get("description") or "—"
-        contacts = _extract_contacts(feature)
-        
-        parsed.append({
-            "id": company.get("id") or name,
-            "name": name,
-            "address": address,
-            "phones": contacts["phones"],
-            "website": contacts["website"],
-            "vk": None,
-            "instagram": None,
-            "telegram": None,
-            "rubrics": [c.get("name") for c in company.get("Categories", []) if c.get("name")],
-        })
-    
-    return parsed
+    for el in elements:
+        item = _extract_from_element(el)
+        if item:
+            parsed.append(item)
+
+    start = (page - 1) * page_size
+    return parsed[start:start + page_size]
 
 async def collect_small_business(query: str, limit: int = 30) -> list[dict]:
-    collected: list[dict] = []
-    page = 1
-    while len(collected) < limit and page <= 5:
-        try:
-            batch = await search_businesses(query, page=page, page_size=20)
-        except Exception as e:
-            logger.exception("Ошибка парсера Яндекс: %s", e)
-            if collected:
-                break
-            raise
-        if not batch:
-            break
-        collected.extend(batch)
-        page += 1
+    tag_filter = CATEGORY_QUERIES.get(query)
+    if not tag_filter:
+        tag_filter = f'["name"~"{query}",i]'
 
+    overpass_query = _build_query(tag_filter)
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(OVERPASS_URL, data={"data": overpass_query})
+            resp.raise_for_status()
+            data = resp.json()
+    except Exception as e:
+        logger.exception("Ошибка Overpass: %s", e)
+        raise
+
+    elements = data.get("elements") or []
     seen = set()
     unique = []
-    for b in collected:
-        key = (b["name"].lower(), b["address"].lower())
+    for el in elements:
+        item = _extract_from_element(el)
+        if not item:
+            continue
+        key = (item["name"].lower(), item["address"].lower())
         if key in seen:
             continue
         seen.add(key)
-        unique.append(b)
-    return unique[:limit]
+        unique.append(item)
+        if len(unique) >= limit:
+            break
+
+    return unique
