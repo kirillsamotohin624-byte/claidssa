@@ -104,7 +104,7 @@ async def help_msg(message: Message):
         "2. Выбери категорию\n"
         "3. Из списка выбери бизнес\n"
         "4. Получи готовое холодное сообщение или промпт для разработки\n\n"
-        "Бот ищет только малый бизнес в Туле через 2ГИС, сети отфильтровываются.\n"
+        "Бот ищет только малый бизнес в Туле через OpenStreetMap, сети отфильтровываются.\n"
         "Тексты генерируются ИИ через OpenRouter.",
         reply_markup=main_menu_kb(),
     )
@@ -135,7 +135,7 @@ async def _load_and_show(callback: CallbackQuery, state: FSMContext, category: s
     except Exception as e:
         logger.exception("Ошибка поиска: %s", e)
         await callback.message.edit_text(
-            "⚠️ 2ГИС не отвечает. Попробуй ещё раз.",
+            "⚠️ Источник данных (OpenStreetMap) не отвечает. Попробуй ещё раз.",
             reply_markup=retry_kb(category),
         )
         return

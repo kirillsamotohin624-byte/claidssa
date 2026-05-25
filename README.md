@@ -1,6 +1,6 @@
 # Tula Smallbiz Bot
 
-Telegram-бот для поиска клиентов малого бизнеса в Туле. Парсит 2ГИС, фильтрует сетевые компании и генерирует холодные сообщения и промпты на разработку через OpenRouter (deepseek/deepseek-chat).
+Telegram-бот для поиска клиентов малого бизнеса в Туле. Парсит OpenStreetMap (Overpass API) — бесплатно и без ключа, фильтрует сетевые компании и генерирует холодные сообщения и промпты на разработку через OpenRouter (deepseek/deepseek-chat).
 
 ## Возможности
 
@@ -16,7 +16,7 @@ Telegram-бот для поиска клиентов малого бизнеса
 
 - Python 3.11
 - aiogram 3.x (FSM, MemoryStorage)
-- httpx (запросы к 2ГИС)
+- httpx (запросы к Overpass API)
 - openai SDK (через OpenRouter)
 - python-dotenv
 
@@ -26,7 +26,7 @@ Telegram-бот для поиска клиентов малого бизнеса
 main.py            # точка входа, polling
 handlers.py        # роутер, FSM, обработчики сообщений и колбэков
 keyboards.py       # все клавиатуры (reply + inline)
-parser.py          # парсер 2ГИС, фильтр сетевиков
+parser.py          # парсер OpenStreetMap Overpass, фильтр сетевиков
 generator.py       # генерация текстов через OpenRouter
 config.py          # переменные окружения, категории, чёрный список сетей
 requirements.txt
@@ -45,14 +45,9 @@ runtime.txt        # python-3.11.9
 4. Введи username (заканчивается на `bot`, например `tula_clients_bot`).
 5. BotFather пришлёт строку вида `123456789:ABC-DEF...` — это `BOT_TOKEN`.
 
-### 2. TWOGIS_API_KEY — бесплатный на 2ГИС
+### 2. Данные о бизнесах — OpenStreetMap (без ключа!)
 
-1. Зайди на [https://dev.2gis.ru/](https://dev.2gis.ru/) (личный кабинет разработчика 2ГИС).
-2. Зарегистрируйся → подтверди email.
-3. В разделе **Ключи API** → **Создать ключ** → выбери продукт **Places API / Catalog API** (`catalog.api.2gis.com`).
-4. Скопируй полученный ключ — это `TWOGIS_API_KEY`.
-
-> Бесплатный тариф даёт лимит запросов в день — для бота с парой пользователей хватает с запасом.
+Бот использует публичный Overpass API (`https://overpass-api.de/api/interpreter`). Никакой регистрации и ключей не нужно — просто работает из коробки. Если хочется альтернативный endpoint (например, при недоступности основного), его можно поменять в `parser.py` на `https://overpass.kumi.systems/api/interpreter` или другой зеркальный.
 
 ### 3. OPENROUTER_API_KEY — на openrouter.ai
 
@@ -73,7 +68,7 @@ source .venv/bin/activate          # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 
 cp .env.example .env
-# отредактируй .env, вставь свои ключи
+# отредактируй .env, вставь BOT_TOKEN и OPENROUTER_API_KEY
 
 python main.py
 ```
@@ -87,7 +82,6 @@ python main.py
 3. Выбери репозиторий, Railway сам определит Python и установит зависимости из `requirements.txt`.
 4. Открой проект → **Variables** → добавь:
    - `BOT_TOKEN`
-   - `TWOGIS_API_KEY`
    - `OPENROUTER_API_KEY`
 5. **Settings → Deploy → Start Command**: `python main.py` (или Railway возьмёт из `Procfile`).
 6. **Settings → Networking**: бот работает по long-polling, публичный порт **не нужен** — Railway сам поднимет worker-процесс.
@@ -103,7 +97,11 @@ python main.py
 
 ## Логика фильтрации
 
-`config.py → CHAIN_BLACKLIST` — список ключевых слов. Если название бизнеса из 2ГИС содержит любое из них (без учёта регистра), бизнес отбрасывается. Это отсекает сети: ритейл, банки, телеком, фастфуд, АЗС, электронику и т. п. Список можно расширять.
+`config.py → CHAIN_BLACKLIST` — список ключевых слов. Если название бизнеса из OpenStreetMap содержит любое из них (без учёта регистра), бизнес отбрасывается. Это отсекает сети: ритейл, банки, телеком, фастфуд, АЗС, электронику и т. п. Список можно расширять.
+
+## Карта тегов OSM
+
+Поиск по категориям ведётся через `parser.py → CATEGORY_QUERIES`. Каждая категория — это OverpassQL-фильтр по тегам OSM (например, `["amenity"="dentist"]` для стоматологий). Если в Туле по какой-то категории мало данных, можно расширить фильтр или добавить новые рубрики.
 
 ## Лицензия
 
