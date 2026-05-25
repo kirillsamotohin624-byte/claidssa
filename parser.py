@@ -24,17 +24,25 @@ OVERPASS_HEADERS = {
 }
 
 DDG_URL = "https://html.duckduckgo.com/html/"
-DDG_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (compatible; TulaBot/1.0)",
-    "Accept": "text/html,application/xhtml+xml",
+BROWSER_UA = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+)
+SEARCH_HEADERS = {
+    "User-Agent": BROWSER_UA,
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "ru,en;q=0.8",
+    "Referer": "https://html.duckduckgo.com/",
+    "Origin": "https://html.duckduckgo.com",
+    "Upgrade-Insecure-Requests": "1",
 }
 
 ENRICH_DELAY_SECONDS = 1.0
 ENRICH_MAX_BUSINESSES = 15
 
 PHONE_REGEX = re.compile(
-    r"(?:\+7|8)[\s\-\(\)]{0,2}\d{3,4}[\s\-\(\)]{0,2}\d{2,3}[\s\-]{0,2}\d{2,3}[\s\-]{0,2}\d{2}"
+    r"(?<!\d)(?:\+7|8)[\s\-\(\)]{0,2}\d{3,4}[\s\-\(\)]{0,2}\d{2,3}"
+    r"[\s\-]{0,2}\d{2,3}[\s\-]{0,2}\d{2}(?!\d)"
 )
 
 URL_REGEX = re.compile(r"https?://[^\s\"'<>]+", re.IGNORECASE)
@@ -268,32 +276,87 @@ def _extract_website_from_soup(soup: BeautifulSoup) -> str | None:
     return None
 
 
+async def _fetch_ddg(client: httpx.AsyncClient, query: str) -> str | None:
+    try:
+        resp = await client.post(
+            DDG_URL,
+            data={"q": query, "kl": "ru-ru", "b": ""},
+        )
+    except (httpx.HTTPError, httpx.TimeoutException) as e:
+        logger.info("DDG недоступен: %s", e)
+        return None
+    if resp.status_code != 200:
+        logger.info("DDG ответил %s", resp.status_code)
+        return None
+    html = resp.text
+    if "anomaly" in html and "result__" not in html:
+        logger.info("DDG показал anti-bot страницу")
+        return None
+    return html
+
+
+async def _fetch_bing(client: httpx.AsyncClient, query: str) -> str | None:
+    try:
+        resp = await client.get(
+            "https://www.bing.com/search",
+            params={"q": query, "setlang": "ru", "cc": "ru"},
+        )
+    except (httpx.HTTPError, httpx.TimeoutException) as e:
+        logger.info("Bing недоступен: %s", e)
+        return None
+    if resp.status_code != 200:
+        logger.info("Bing ответил %s", resp.status_code)
+        return None
+    return resp.text
+
+
+def _extract_website_from_bing(html: str) -> str | None:
+    soup = _safe_soup(html)
+    if soup is None:
+        return None
+    for li in soup.select("li.b_algo"):
+        cite = li.find("cite")
+        if cite:
+            url = cite.get_text(" ", strip=True)
+            if url and not url.startswith("http"):
+                url = "https://" + url.split()[0]
+            if url and not _is_blacklisted_url(url):
+                return url
+        link = li.find("a", href=True)
+        if link and link["href"].startswith("http"):
+            if not _is_blacklisted_url(link["href"]):
+                return link["href"]
+    return None
+
+
+def _safe_soup(html: str) -> BeautifulSoup | None:
+    try:
+        return BeautifulSoup(html, "lxml")
+    except Exception:
+        try:
+            return BeautifulSoup(html, "html.parser")
+        except Exception as e:
+            logger.info("Не удалось распарсить HTML: %s", e)
+            return None
+
+
 async def _enrich_one(client: httpx.AsyncClient, business: dict) -> None:
     name = business.get("name") or ""
     if not name:
         return
     query = f"{name} Тула телефон сайт"
-    try:
-        resp = await client.get(DDG_URL, params={"q": query}, headers=DDG_HEADERS)
-        if resp.status_code != 200:
-            logger.info("DDG ответил %s для %r", resp.status_code, name)
-            return
-        html = resp.text
-    except (httpx.HTTPError, httpx.TimeoutException) as e:
-        logger.info("DDG недоступен для %r: %s", name, e)
-        return
-    except Exception as e:
-        logger.info("DDG ошибка для %r: %s", name, e)
+
+    html = await _fetch_ddg(client, query)
+    used_bing = False
+    if not html:
+        html = await _fetch_bing(client, query)
+        used_bing = True
+    if not html:
         return
 
-    try:
-        soup = BeautifulSoup(html, "lxml")
-    except Exception:
-        try:
-            soup = BeautifulSoup(html, "html.parser")
-        except Exception as e:
-            logger.info("Не удалось распарсить DDG для %r: %s", name, e)
-            return
+    soup = _safe_soup(html)
+    if soup is None:
+        return
 
     if not business.get("phones"):
         phones = _extract_phones_from_html(html)
@@ -301,7 +364,10 @@ async def _enrich_one(client: httpx.AsyncClient, business: dict) -> None:
             business["phones"] = phones
 
     if not business.get("website"):
-        website = _extract_website_from_soup(soup)
+        if used_bing:
+            website = _extract_website_from_bing(html)
+        else:
+            website = _extract_website_from_soup(soup)
         if website:
             business["website"] = website
 
@@ -312,7 +378,7 @@ async def _enrich_via_duckduckgo(businesses: list[dict]) -> list[dict]:
         return businesses
     targets = targets[:ENRICH_MAX_BUSINESSES]
 
-    async with httpx.AsyncClient(timeout=15.0, headers=DDG_HEADERS, follow_redirects=True) as client:
+    async with httpx.AsyncClient(timeout=15.0, headers=SEARCH_HEADERS, follow_redirects=True) as client:
         for i, business in enumerate(targets):
             try:
                 await _enrich_one(client, business)
